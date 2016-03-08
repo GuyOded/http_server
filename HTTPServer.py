@@ -16,25 +16,31 @@ import HTTPValidation
 import HTTPResponse
 import HTTPHeaders
 import os.path as path
+import public_response_functions
+from server_constants import *
+import server_functions
 
 # determines how much information will be printed
 # TODO: add a logfile
 DEBUG_LEVEL = 0
-# The methods the server supports at the moment
-SUPPORTED_METHODS = ["GET"]
-# Not Found HTML file name, must be in root
-NOT_FOUND = "not_found.html"
 
 
 class HTTPServer(object):
-    def __init__(self, root, address=constants.ADDR):
+    def __init__(self, root, restricted_folders,
+                 restricted_page=RESTRICTED_HTML_PAGE, address=constants.ADDR):
         """
         Constructs an HTTPServer object
+        :type root: str
         :param root: The absolute path path of
+        :type restricted_folders: list
+        :param restricted_folders: folders in root that are not to be accessed
+        :type address: tuple
         :param address: The server's socket will be bound to
                         the given address tuple e.g ("localhost", 8080)
         """
         self._root = root
+        self._restricted_folders = restricted_folders
+        self._restricted_html = restricted_page
         self._client = socket.socket()
         try:
             self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -100,7 +106,7 @@ class HTTPServer(object):
             if not HTTPValidation.validate_request(request):
                 if DEBUG_LEVEL >= 0:
                     print "Invalid request, closing..."
-                self._client.send(get_error_response())
+                self._client.send(public_response_functions.get_error_response())
                 self._client.close()
                 return True
 
@@ -126,40 +132,114 @@ class HTTPServer(object):
 
         request = HTTPRequest.HTTPRequest(request_line, headers, DEBUG_LEVEL)
 
-        if request.get_method() not in SUPPORTED_METHODS:
-            if DEBUG_LEVEL >= 0:
-                print "Unsupported request method"
-            # send code 500
-            self._client.send(get_error_response())
+        uri = request.get_uri_with_no_params()
+        uri = uri[1:] if uri[0] == "/" else uri
+
+        if uri in server_functions.AVAILABLE_FUNCTIONS.keys():
+            response, flag = server_functions.\
+                             AVAILABLE_FUNCTIONS[uri](request.get_params())
+            self._client.send(response.build_response())
+            return flag
+
+        result = self._check_status_errors(request)
+        if result == -1:
             return False
-
-        # perform a small cast to index.html if the uri is empty
-        url = request.get_url()[1:] if request.get_url()[0] == "/" else \
-            request.get_url()
-
-        # if url is / change to index.html
-        url = "index.html" if url == "" else url
-
-        full_file_path = path.join(self._root, url)
-        if not path.isfile(full_file_path):
-            if DEBUG_LEVEL >= 0:
-                print "File: {} not found".format(full_file_path)
-            # send 404 Not Found response
-            self._client.send(self._get_404_response())
+        elif result == 1:
             return True
+
+        full_file_path = self._get_full_path(request)
 
         requested_file = open(full_file_path, "r")
         data = requested_file.read()
         requested_file.close()
 
         headers = HTTPHeaders.HTTPHeaders()
-        add_default_headers(headers)
+        public_response_functions.add_default_headers(headers)
         headers["Content-Length"] = str(len(data))
 
         response = HTTPResponse.HTTPResponse(version=1.0, status_code=200,
                                              phrase="OK", headers=headers)
         self._client.send(response.build_response() + data)
         return True
+
+    def _check_status_errors(self, request):
+        """
+        given an HTTPRequest checks for various status errors
+        and sends them to the client if necessary. For example:
+        if the client tries to access a restricted folder error 403
+        will be sent.
+        :param request:
+        :return: 1 if an error was sent and the server shouldn't terminate
+                 connection 0 if no errors were sent and -1 in case
+                 the server should close the connection with the client
+        """
+        if request.get_method() not in SUPPORTED_METHODS:
+            if DEBUG_LEVEL >= 0:
+                print "Unsupported request method: {}".format(request.get_method())
+            # send code 405
+            response = HTTPResponse.HTTPResponse(version=1.0, status_code=405,
+                                                 phrase="Method Not Allowed")
+            headers = HTTPHeaders.HTTPHeaders()
+            public_response_functions.add_default_headers(headers)
+            headers["Content-Length"] = "0"
+            response.set_headers(headers)
+            self._client.send(response.build_response())
+            return -1
+
+        full_file_path = self._get_full_path(request)
+        # check if the root abs path is the first substring at the
+        # start, if not send forbidden response
+        if self._is_restricted(full_file_path):
+            if DEBUG_LEVEL >= 0:
+                print "Client tried to access {} which is restricted".format(full_file_path)
+            self._client.send(self._get_restricted_error())
+            return 1
+
+        if not path.isfile(full_file_path):
+            if DEBUG_LEVEL >= 0:
+                print "File: {} not found".format(full_file_path)
+            # send 404 Not Found response
+            self._client.send(self._get_404_response())
+            return 1
+
+        return 0
+
+    def _get_full_path(self, request):
+        """
+        Given HTTPRequest returns a real path to the requested
+        file. If the url is / substitutes it for index.html
+        :param request: HTTPRequest
+        :return: a real path to the requested file
+        """
+        # get rid of the preceding /
+        url = request.get_uri()[1:] if request.get_uri()[0] == "/" else \
+            request.get_uri()
+
+        # if url is / change to index.html
+        url = "index.html" if url == "" else url
+
+        full_file_path = path.join(self._root, url)
+        full_file_path = path.realpath(full_file_path)
+
+        return full_file_path
+
+    def _is_restricted(self, real_path):
+        """
+        given a full real path of a file or directory, checks if the file
+        is in a restricted area
+        :param real_path:
+        :return:
+        """
+        if real_path.find(self._root) != 0:
+            return True
+
+        # get rid of the root part plus the following /
+        real_path = real_path[len(self._root)+1:]
+        for folder in self._restricted_folders:
+            if real_path.find(folder) == 0:
+                return True
+
+        return False
 
     def _get_404_response(self):
         """
@@ -168,9 +248,13 @@ class HTTPServer(object):
         """
         response = HTTPResponse.HTTPResponse(version=1.0, status_code=404,
                                              phrase="Not Found")
+        # try to open not_found.html if it exists and utilize it
+        # for the message
+        # in case opening the file was unsuccessful just create a quick
+        # message
         try:
             file_path = path.join(self._root, NOT_FOUND)
-            f = open(file_path)
+            f = open(file_path, "r")
         except IOError:
             message = "<body><h1>Not Found</h1></body>"
             if DEBUG_LEVEL >= 2:
@@ -180,7 +264,7 @@ class HTTPServer(object):
             f.close()
 
         headers = HTTPHeaders.HTTPHeaders()
-        add_default_headers(headers)
+        public_response_functions.add_default_headers(headers)
         headers["Content-Length"] = str(len(message))
         headers["Content-Type"] = "text/html"
         response.set_headers(headers)
@@ -189,49 +273,32 @@ class HTTPServer(object):
 
         return response.build_response()
 
+    def _get_restricted_error(self):
+        """
+        builds a typical restricted file/path response
+        :return:
+        """
+        response = HTTPResponse.HTTPResponse(version=1.0, status_code=403,
+                                             phrase="Forbidden")
+        headers = HTTPHeaders.HTTPHeaders()
+        headers["Content-Type"] = "text/html"
+        public_response_functions.add_default_headers(headers)
 
-def get_error_response():
-    """
-    builds a typical http error response
-    :return: an http error response
-    """
-    response = HTTPResponse.HTTPResponse(version=1.0, status_code=500,
-                                         phrase="Internal Error")
-    headers = HTTPHeaders.HTTPHeaders()
-    add_default_headers(headers)
-    headers["Content-Length"] = str(0)
-    headers["Connection"] = "close"
-    response.set_headers(headers)
+        response_body = "<html><body><h1>Forbidden</h1></body></html>"
 
-    return response.build_response()
+        try:
+            html_page = open(path.join(self._root, self._restricted_html))
+        except IOError:
+            if DEBUG_LEVEL >= 2:
+                print "File {} wasn't found in root".format(self._restricted_html)
+        else:
+            response_body = html_page.read()
 
+        headers["Content-Length"] = str(len(response_body))
+        response.set_data(response_body)
+        response.set_headers(headers)
 
-def add_default_headers(headers):
-    """
-    The following headers are usually added to an http message
-    so this function adds them to a headers object instead of adding
-    them manually in the code
-    :param headers: The headers will be added to this argument
-    :return: None
-    """
-    headers["Allow"] = ", ".join(SUPPORTED_METHODS)
-    headers["Connection"] = "keep-alive"
-    headers["Date"] = get_rfc_822_time()
-
-
-def get_rfc_822_time():
-    """
-    :return: an rfc 822 compliant datetime string
-    """
-    from datetime import datetime
-    from time import gmtime, strftime
-    dt = datetime.now()
-    today = dt.strftime("%A")[:3]
-    month = dt.strftime("%B")[:3]
-    time = dt.strftime("%H:%M:%S")
-    tz = strftime("%Z", gmtime())
-    return "{}, {} {} {} {} {}".format(today, dt.strftime("%d"), month,
-                                       dt.strftime("%Y"), time, tz)
+        return response.build_response()
 
 
 def split_http_request(request):

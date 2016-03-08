@@ -14,7 +14,8 @@ def validate_request_line(request_line):
     :param request_line: The request line of an http message
     :return:
     """
-    pattern = re.compile("[A-Z]{3,7} [/a-zA-Z._\-0-9]+ HTTP/1\.[01]\r\n")
+    pattern = re.compile("[A-Z]{3,7} [/a-zA-Z._\-0-9]+\??"
+                         "[a-zA-Z._\-0-9=&]* HTTP/1\.[01]")
     return True if re.match(pattern, request_line) else False
 
 
